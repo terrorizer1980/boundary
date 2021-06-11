@@ -69,16 +69,25 @@ func (r *Repository) listServersWithReader(ctx context.Context, reader db.Reader
 	if liveness == 0 {
 		liveness = defaultLiveness
 	}
+
+	var where string
+	if liveness > 0 {
+		where = fmt.Sprintf("type = $1 and update_time > now() - interval '%d seconds'", uint32(liveness.Seconds()))
+	} else {
+		where = "type = $1"
+	}
+
 	var servers []*Server
 	if err := reader.SearchWhere(
 		ctx,
 		&servers,
-		fmt.Sprintf("type = $1 and update_time > now() - interval '%d seconds'", uint32(liveness.Seconds())),
+		where,
 		[]interface{}{serverType},
 		db.WithLimit(-1),
 	); err != nil {
 		return nil, errors.Wrap(err, "servers.listServersWithReader")
 	}
+
 	return servers, nil
 }
 

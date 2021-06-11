@@ -99,18 +99,16 @@ func (r *Repository) DeleteConnection(ctx context.Context, publicId string, _ ..
 	return rowsDeleted, nil
 }
 
-// CloseDeadConnectionsOnWorkerReport will run the connectionsToClose CTE to
-// look for connections that should be marked closed because they are no longer
-// claimed by a server. This does notdetect connections where the server is no
-// longer reporting status; that's for a different CTE to be called by a
-// heartbeat detector.
+// CloseDeadConnectionsForWorker will run closeDeadConnectionsCte to look for
+// connections that should be marked closed because they are no longer claimed
+// by a server.
 //
 // The foundConns input should be the currently-claimed connections; the CTE
 // uses a NOT IN clause to ensure these are excluded. It is not an error for
 // this to be empty as the worker could claim no connections; in that case all
 // connections will immediately transition to closed.
-func (r *Repository) CloseDeadConnectionsOnWorkerReport(ctx context.Context, serverId string, foundConns []string) (int, error) {
-	const op = "session.(Repository).CloseDeadConnectionsOnWorkerReport"
+func (r *Repository) CloseDeadConnectionsForWorker(ctx context.Context, serverId string, foundConns []string) (int, error) {
+	const op = "session.(Repository).CloseDeadConnectionsForWorker"
 	if serverId == "" {
 		return db.NoRowsAffected, errors.New(errors.InvalidParameter, op, "missing server id")
 	}
@@ -135,7 +133,7 @@ func (r *Repository) CloseDeadConnectionsOnWorkerReport(ctx context.Context, ser
 		db.ExpBackoff{},
 		func(reader db.Reader, w db.Writer) error {
 			var err error
-			rowsAffected, err = w.Exec(ctx, fmt.Sprintf(connectionsToCloseCte, publicIdStr), args)
+			rowsAffected, err = w.Exec(ctx, fmt.Sprintf(closeDeadConnectionsCte, publicIdStr), args)
 			if err != nil {
 				return errors.Wrap(err, op)
 			}
@@ -146,6 +144,69 @@ func (r *Repository) CloseDeadConnectionsOnWorkerReport(ctx context.Context, ser
 		return db.NoRowsAffected, errors.Wrap(err, op)
 	}
 	return rowsAffected, nil
+}
+
+// ShouldCloseConnectionsOnWorker will run shouldCloseConnectionsCte to look
+// for connections that the worker should close because they are currently
+// reporting them as open incorrectly.
+//
+// The foundConns input here is used to filter closed connection states. This
+// is further filtered against the filterSessions input, which is expected to
+// be a set of sessions we've already submitted close requests for, so adding
+// them again would be redundant.
+//
+// The returned map[string][]string is indexed by session ID.
+func (r *Repository) ShouldCloseConnectionsOnWorker(ctx context.Context, foundConns, filterSessions []string) (map[string][]string, error) {
+	const op = "session.(Repository).ShouldCloseConnectionsOnWorker"
+	if len(foundConns) < 1 {
+		return nil, nil // nothing to do
+	}
+
+	args := make([]interface{}, 0, len(foundConns)+len(filterSessions))
+
+	// foundConns first
+	connsParams := make([]string, len(foundConns))
+	for i, connId := range foundConns {
+		connsParams[i] = fmt.Sprintf("$%d", i+1)
+		args = append(args, connId)
+	}
+	connsStr := strings.Join(connsParams, ",")
+
+	// then filterSessions
+	var sessionsStr string
+	if len(filterSessions) > 0 {
+		offset := len(foundConns) + 1
+		sessionsParams := make([]string, len(filterSessions))
+		for i, sessionId := range filterSessions {
+			sessionsParams[i] = fmt.Sprintf("$%d", i+offset)
+			args = append(args, sessionId)
+		}
+
+		const sessionIdFmtStr = `and session_id not in (%s)`
+		sessionsStr = fmt.Sprintf(sessionIdFmtStr, strings.Join(sessionsParams, ","))
+	}
+
+	rows, err := r.reader.Query(
+		ctx,
+		fmt.Sprintf(shouldCloseConnectionsCte, connsStr, sessionsStr),
+		args,
+	)
+
+	if err != nil {
+		return nil, errors.Wrap(err, op)
+	}
+
+	result := make(map[string][]string)
+	for rows.Next() {
+		var connectionId, sessionId string
+		if err := rows.Scan(&connectionId, &sessionId); err != nil {
+			return nil, errors.Wrap(err, op)
+		}
+
+		result[sessionId] = append(result[sessionId], connectionId)
+	}
+
+	return result, nil
 }
 
 func fetchConnectionStates(ctx context.Context, r db.Reader, connectionId string, opt ...db.Option) ([]*ConnectionState, error) {
