@@ -235,13 +235,13 @@ where
 )
 `
 
-	// connectionsToCloseCte finds connections that are:
+	// closeDeadConnectionsCte finds connections that are:
 	//
 	// * not closed
 	// * not announced by a given server in its latest update
 	//
 	// and marks them as closed.
-	connectionsToCloseCte = `
+	closeDeadConnectionsCte = `
 with
   -- Find connections that are not closed so we can reference those IDs
   unclosed_connections as (
@@ -278,5 +278,35 @@ with
     where
       public_id in (select public_id from connections_to_close)
     returning public_id
+  `
+
+	// shouldCloseConnectionsCte finds connections that are marked as closed in
+	// the database given a set of connection IDs. They are returned along with
+	// their associated session ID.
+	//
+	// The second parameter is a set of session IDs that we have already
+	// submitted a session-wide close request for, so sending another change
+	// request for them would be redundant.
+	shouldCloseConnectionsCte = `
+with
+  -- Find connections that are closed so we can reference those IDs
+  closed_connections as (
+    select connection_id
+      from session_connection_state
+    where
+      -- It's the current state
+      end_time is null
+        and
+      -- Current state isn't closed state
+      state = 'closed'
+        and
+      connection_id in (%s)
+  )
+  select public_id, session_id 
+    from session_connection
+  where
+    public_id in (select connection_id from closed_connections)
+    -- Below fmt arg is filled in if there are session IDs to filter against
+    %s
   `
 )

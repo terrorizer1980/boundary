@@ -3,8 +3,6 @@ package worker
 import (
 	"context"
 	"math/rand"
-	"os"
-	"strconv"
 	"time"
 
 	pbs "github.com/hashicorp/boundary/internal/gen/controller/servers/services"
@@ -15,47 +13,9 @@ import (
 
 // In the future we could make this configurable
 const (
-	statusInterval           = 2 * time.Second
-	statusTimeout            = 10 * time.Second
-	defaultStatusGracePeriod = 30 * time.Second
-	statusGracePeriodEnvVar  = "BOUNDARY_STATUS_GRACE_PERIOD"
+	statusInterval = 2 * time.Second
+	statusTimeout  = 3 * time.Second
 )
-
-// statusGracePeriod returns the status grace period setting for this
-// worker, in seconds.
-//
-// The grace period is the length of time we allow connections to run
-// on a worker in the event of an error sending status updates. The
-// period is defined the length of time since the last successful
-// update.
-//
-// The setting is derived from one of the following:
-//
-//   * BOUNDARY_STATUS_GRACE_PERIOD, if defined, can be set to an
-//   integer value to define the setting.
-//   * If this is missing, the default (30 seconds) is used.
-//
-func (w *Worker) statusGracePeriod() time.Duration {
-	if v := os.Getenv(statusGracePeriodEnvVar); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			w.logger.Error("could not read setting for BOUNDARY_STATUS_GRACE_PERIOD, using default",
-				"err", err,
-				"value", v,
-			)
-			return defaultStatusGracePeriod
-		}
-
-		if n < 1 {
-			w.logger.Error("invalid setting for BOUNDARY_STATUS_GRACE_PERIOD, using default", "value", v)
-			return defaultStatusGracePeriod
-		}
-
-		return time.Second * time.Duration(n)
-	}
-
-	return defaultStatusGracePeriod
-}
 
 type LastStatusInformation struct {
 	*pbs.StatusResponse
@@ -285,7 +245,7 @@ func (w *Worker) lastSuccessfulStatusTime() time.Time {
 
 func (w *Worker) isPastGrace() (bool, time.Time, time.Duration) {
 	t := w.lastSuccessfulStatusTime()
-	u := w.statusGracePeriod()
+	u := w.conf.StatusGracePeriodDuration
 	v := time.Since(t)
 	return v > u, t, u
 }

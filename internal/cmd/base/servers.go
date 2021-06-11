@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/boundary/globals"
@@ -37,6 +38,11 @@ import (
 	"github.com/jinzhu/gorm"
 	"github.com/mitchellh/cli"
 	"google.golang.org/grpc/grpclog"
+)
+
+const (
+	defaultStatusGracePeriod = 15 * time.Second
+	statusGracePeriodEnvVar  = "BOUNDARY_STATUS_GRACE_PERIOD"
 )
 
 type Server struct {
@@ -97,6 +103,11 @@ type Server struct {
 	DevDatabaseCleanupFunc     func() error
 
 	Database *gorm.DB
+
+	// StatusGracePeriodDuration represents the period of time (as a
+	// duration) that the controller will wait before marking
+	// connections from a disconnected worker as invalid.
+	StatusGracePeriodDuration time.Duration
 }
 
 func NewServer(cmd *Command) *Server {
@@ -605,4 +616,50 @@ func MakeSighupCh() chan struct{} {
 		}
 	}()
 	return resultCh
+}
+
+// SetStatusGracePeriodDuration sets the value for
+// StatusGracePeriodDuration.
+//
+// The grace period is the length of time we allow connections to run
+// on a worker in the event of an error sending status updates. The
+// period is defined the length of time since the last successful
+// update.
+//
+// The setting is derived from one of the following, in order:
+//
+//   * Via the supplied value if non-zero.
+//   * BOUNDARY_STATUS_GRACE_PERIOD, if defined, can be set to an
+//   integer value to define the setting.
+//   * If either of these is missing, the default (15 seconds) is
+//   used.
+//
+// The minimum setting for this value is the default setting. Values
+// below this will be reset to the default.
+func (s *Server) SetStatusGracePeriodDuration(value time.Duration) {
+	var result time.Duration
+	switch {
+	case value > 0:
+		result = value
+	case os.Getenv(statusGracePeriodEnvVar) != "":
+		v := os.Getenv(statusGracePeriodEnvVar)
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			s.Logger.Error(fmt.Sprintf("could not read setting for %s", statusGracePeriodEnvVar),
+				"err", err,
+				"value", v,
+			)
+			break
+		}
+
+		result = time.Second * time.Duration(n)
+	}
+
+	if result < defaultStatusGracePeriod {
+		s.Logger.Debug("invalid grace period setting or none provided, using default", "value", result, "default", defaultStatusGracePeriod)
+		result = defaultStatusGracePeriod
+	}
+
+	s.Logger.Debug("session cleanup in effect, connections will be terminated if status reports cannot be made", "grace_period", result)
+	s.StatusGracePeriodDuration = result
 }
