@@ -674,6 +674,7 @@ func (c *Command) Reload(newConf *config.Config) error {
 
 	if newConf != nil && c.worker != nil {
 		c.worker.ParseAndStoreTags(newConf.Worker.Tags)
+		c.worker.CloseConnectionsForShutdownOrReload()
 	}
 
 	// Send a message that we reloaded. This prevents "guessing" sleep times

@@ -2,42 +2,19 @@ package cluster
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/binary"
-	"errors"
-	"fmt"
-	"io"
 	"net"
-	"net/http"
-	"strconv"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/boundary/api/targets"
-	"github.com/hashicorp/boundary/globals"
 	"github.com/hashicorp/boundary/internal/cmd/config"
-	targetspb "github.com/hashicorp/boundary/internal/gen/controller/api/resources/targets"
-	"github.com/hashicorp/boundary/internal/proxy"
 	"github.com/hashicorp/boundary/internal/servers/controller"
 	"github.com/hashicorp/boundary/internal/servers/worker"
 	"github.com/hashicorp/boundary/internal/session"
+	"github.com/hashicorp/boundary/internal/tests/helper"
 	"github.com/hashicorp/dawdle"
-	"github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/vault/sdk/helper/base62"
-	"github.com/mr-tron/base58"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/protobuf/proto"
-	"nhooyr.io/websocket"
-	"nhooyr.io/websocket/wspb"
-)
-
-const (
-	defaultGracePeriod  = time.Second * 15
-	testSendRecvSendMax = uint32(defaultGracePeriod * 3 / time.Second)
 )
 
 // timeoutBurdenType details our "burden cases" for the session
@@ -75,18 +52,18 @@ var timeoutBurdenCases = []timeoutBurdenType{timeoutBurdenTypeDefault, timeoutBu
 
 func controllerGracePeriod(ty timeoutBurdenType) time.Duration {
 	if ty == timeoutBurdenTypeWorker {
-		return defaultGracePeriod * 10
+		return helper.DefaultGracePeriod * 10
 	}
 
-	return defaultGracePeriod
+	return helper.DefaultGracePeriod
 }
 
 func workerGracePeriod(ty timeoutBurdenType) time.Duration {
 	if ty == timeoutBurdenTypeController {
-		return defaultGracePeriod * 10
+		return helper.DefaultGracePeriod * 10
 	}
 
-	return defaultGracePeriod
+	return helper.DefaultGracePeriod
 }
 
 // TestWorkerSessionCleanup is the main test for session cleanup, and
@@ -164,15 +141,15 @@ func testWorkerSessionCleanupSingle(burdenCase timeoutBurdenType) func(t *testin
 		require.NotNil(tgt)
 
 		// Create test server, update default port on target
-		ts := newTestTcpServer(t, logger)
-		require.NotNil(t, ts)
+		ts := helper.NewTestTcpServer(t, logger)
+		require.NotNil(ts)
 		defer ts.Close()
 		tgt, err = tcl.Update(ctx, tgt.Item.Id, tgt.Item.Version, targets.WithTcpTargetDefaultPort(ts.Port()))
 		require.NoError(err)
 		require.NotNil(tgt)
 
 		// Authorize and connect
-		sess := newTestSession(ctx, t, logger, tcl, "ttcp_1234567890")
+		sess := helper.NewTestSession(ctx, t, logger, tcl, "ttcp_1234567890")
 		sConn := sess.Connect(ctx, t)
 
 		// Run initial send/receive test, make sure things are working
@@ -198,9 +175,9 @@ func testWorkerSessionCleanupSingle(burdenCase timeoutBurdenType) func(t *testin
 
 		// Wait for post-failure connection state (depends on burden case)
 		if burdenCase == timeoutBurdenTypeWorker {
-			sess.ExpectConnectionStateOnController(ctx, t, c1, session.StatusConnected)
+			expectConnectionStateOnController(ctx, t, sess, c1, session.StatusConnected)
 		} else {
-			sess.ExpectConnectionStateOnController(ctx, t, c1, session.StatusClosed)
+			expectConnectionStateOnController(ctx, t, sess, c1, session.StatusClosed)
 		}
 
 		// Resume the connection, and reconnect.
@@ -218,7 +195,7 @@ func testWorkerSessionCleanupSingle(burdenCase timeoutBurdenType) func(t *testin
 			// a connection status, ensure that our old session's
 			// connections are actually closed now that the worker is
 			// properly reporting in again.
-			sess.ExpectConnectionStateOnController(ctx, t, c1, session.StatusClosed)
+			expectConnectionStateOnController(ctx, t, sess, c1, session.StatusClosed)
 
 		case timeoutBurdenTypeController:
 			// If we are expecting the controller to be the source of
@@ -229,7 +206,7 @@ func testWorkerSessionCleanupSingle(burdenCase timeoutBurdenType) func(t *testin
 
 		// Proceed with new connection test
 		logger.Debug("connecting to new session after resuming controller/worker link")
-		sess = newTestSession(ctx, t, logger, tcl, "ttcp_1234567890") // re-assign, other connection will close in t.Cleanup()
+		sess = helper.NewTestSession(ctx, t, logger, tcl, "ttcp_1234567890") // re-assign, other connection will close in t.Cleanup()
 		sConn = sess.Connect(ctx, t)
 		sConn.TestSendRecvAll(t)
 	}
@@ -330,7 +307,7 @@ func testWorkerSessionCleanupMulti(burdenCase timeoutBurdenType) func(t *testing
 		require.NotNil(tgt)
 
 		// Create test server, update default port on target
-		ts := newTestTcpServer(t, logger)
+		ts := helper.NewTestTcpServer(t, logger)
 		require.NotNil(ts)
 		defer ts.Close()
 		tgt, err = tcl.Update(ctx, tgt.Item.Id, tgt.Item.Version, targets.WithTcpTargetDefaultPort(ts.Port()))
@@ -338,7 +315,7 @@ func testWorkerSessionCleanupMulti(burdenCase timeoutBurdenType) func(t *testing
 		require.NotNil(tgt)
 
 		// Authorize and connect
-		sess := newTestSession(ctx, t, logger, tcl, "ttcp_1234567890")
+		sess := helper.NewTestSession(ctx, t, logger, tcl, "ttcp_1234567890")
 		sConn := sess.Connect(ctx, t)
 
 		// Run initial send/receive test, make sure things are working
@@ -377,9 +354,9 @@ func testWorkerSessionCleanupMulti(burdenCase timeoutBurdenType) func(t *testing
 
 		// Wait for post-failure connection state (depends on burden case)
 		if burdenCase == timeoutBurdenTypeWorker {
-			sess.ExpectConnectionStateOnController(ctx, t, c1, session.StatusConnected)
+			expectConnectionStateOnController(ctx, t, sess, c1, session.StatusConnected)
 		} else {
-			sess.ExpectConnectionStateOnController(ctx, t, c1, session.StatusClosed)
+			expectConnectionStateOnController(ctx, t, sess, c1, session.StatusClosed)
 		}
 
 		// Finally resume both, try again. Should behave as per normal.
@@ -398,7 +375,7 @@ func testWorkerSessionCleanupMulti(burdenCase timeoutBurdenType) func(t *testing
 			// a connection status, ensure that our old session's
 			// connections are actually closed now that the worker is
 			// properly reporting in again.
-			sess.ExpectConnectionStateOnController(ctx, t, c1, session.StatusClosed)
+			expectConnectionStateOnController(ctx, t, sess, c1, session.StatusClosed)
 
 		case timeoutBurdenTypeController:
 			// If we are expecting the controller to be the source of
@@ -409,354 +386,21 @@ func testWorkerSessionCleanupMulti(burdenCase timeoutBurdenType) func(t *testing
 
 		// Proceed with new connection test
 		logger.Debug("connecting to new session after resuming controller/worker link")
-		sess = newTestSession(ctx, t, logger, tcl, "ttcp_1234567890") // re-assign, other connection will close in t.Cleanup()
+		sess = helper.NewTestSession(ctx, t, logger, tcl, "ttcp_1234567890") // re-assign, other connection will close in t.Cleanup()
 		sConn = sess.Connect(ctx, t)
 		sConn.TestSendRecvAll(t)
 	}
 }
 
-// testSession represents an authorized session.
-type testSession struct {
-	sessionId       string
-	workerAddr      string
-	transport       *http.Transport
-	tofuToken       string
-	connectionsLeft int32
-	logger          hclog.Logger
-}
-
-// newTestSession authorizes a session and creates all of the data
-// necessary to initialize.
-func newTestSession(
+func expectConnectionStateOnController(
 	ctx context.Context,
 	t *testing.T,
-	logger hclog.Logger,
-	tcl *targets.Client,
-	targetId string,
-) *testSession {
-	require := require.New(t)
-	sar, err := tcl.AuthorizeSession(ctx, "ttcp_1234567890")
-	require.NoError(err)
-	require.NotNil(sar)
-
-	s := &testSession{
-		sessionId: sar.Item.SessionId,
-		logger:    logger,
-	}
-	authzString := sar.GetItem().(*targets.SessionAuthorization).AuthorizationToken
-	marshaled, err := base58.FastBase58Decoding(authzString)
-	require.NoError(err)
-	require.NotZero(marshaled)
-
-	sessionAuthzData := new(targetspb.SessionAuthorizationData)
-	err = proto.Unmarshal(marshaled, sessionAuthzData)
-	require.NoError(err)
-	require.NotZero(sessionAuthzData.GetWorkerInfo())
-
-	s.workerAddr = sessionAuthzData.GetWorkerInfo()[0].GetAddress()
-
-	parsedCert, err := x509.ParseCertificate(sessionAuthzData.Certificate)
-	require.NoError(err)
-	require.Len(parsedCert.DNSNames, 1)
-
-	certPool := x509.NewCertPool()
-	certPool.AddCert(parsedCert)
-	tlsConf := &tls.Config{
-		Certificates: []tls.Certificate{
-			{
-				Certificate: [][]byte{sessionAuthzData.Certificate},
-				PrivateKey:  ed25519.PrivateKey(sessionAuthzData.PrivateKey),
-				Leaf:        parsedCert,
-			},
-		},
-		RootCAs:    certPool,
-		ServerName: parsedCert.DNSNames[0],
-		MinVersion: tls.VersionTLS13,
-	}
-
-	s.transport = cleanhttp.DefaultTransport()
-	s.transport.DisableKeepAlives = false
-	s.transport.TLSClientConfig = tlsConf
-	s.transport.IdleConnTimeout = 0
-
-	return s
-}
-
-// connect returns a connected websocket for the stored session,
-// connecting to the stored workerAddr with the configured transport.
-//
-// The returned (wrapped) net.Conn should be ready for communication.
-func (s *testSession) connect(ctx context.Context, t *testing.T) net.Conn {
-	require := require.New(t)
-	conn, resp, err := websocket.Dial(
-		ctx,
-		fmt.Sprintf("wss://%s/v1/proxy", s.workerAddr),
-		&websocket.DialOptions{
-			HTTPClient: &http.Client{
-				Transport: s.transport,
-			},
-			Subprotocols: []string{globals.TcpProxyV1},
-		},
-	)
-	require.NoError(err)
-	require.NotNil(conn)
-	require.NotNil(resp)
-	require.Equal(resp.Header.Get("Sec-WebSocket-Protocol"), globals.TcpProxyV1)
-
-	// Send the handshake.
-	if s.tofuToken == "" {
-		s.tofuToken, err = base62.Random(20)
-	}
-
-	require.NoError(err)
-	handshake := proxy.ClientHandshake{TofuToken: s.tofuToken}
-	err = wspb.Write(ctx, conn, &handshake)
-	require.NoError(err)
-
-	// Receive/check the handshake
-	var handshakeResult proxy.HandshakeResult
-	err = wspb.Read(ctx, conn, &handshakeResult)
-	require.NoError(err)
-
-	// This is just a cursory check to make sure that the handshake is
-	// populated. We could check connections remaining too, but that
-	// could legitimately be a trivial (zero) value.
-	require.NotNil(handshakeResult.GetExpiration())
-	s.connectionsLeft = handshakeResult.GetConnectionsLeft()
-
-	return websocket.NetConn(ctx, conn, websocket.MessageBinary)
-}
-
-// TestNoConnectionsLeft asserts that there are no connections left.
-func (s *testSession) TestNoConnectionsLeft(t *testing.T) {
-	require.Zero(t, s.connectionsLeft)
-}
-
-// ExpectConnectionStateOnController waits for all connections on
-// the session to transition to the closed state on the controller.
-func (s *testSession) ExpectConnectionStateOnController(
-	ctx context.Context,
-	t *testing.T,
+	sess *helper.TestSession,
 	tc *controller.TestController,
 	expectState session.ConnectionStatus,
 ) {
 	require := require.New(t)
-	// This is just for initialization of the actual state set.
-	const sessionStatusUnknown session.ConnectionStatus = "unknown"
-
-	// This currently needs to be at least 1m to deal with overlap on
-	// the scheduler's default job interval.
-	ctx, cancel := context.WithTimeout(ctx, time.Second*90)
-	defer cancel()
-
-	// Get all connections for the session on the controller.
 	sessionRepo, err := tc.Controller().SessionRepoFn()
 	require.NoError(err)
-	conns, err := sessionRepo.ListConnectionsBySessionId(ctx, s.sessionId)
-	require.NoError(err)
-	if len(conns) < 1 {
-		s.logger.Warn("no connections returned for session, nothing to do")
-		return
-	}
-
-	// Set up the waitgroups.
-	var wg sync.WaitGroup
-	wg.Add(len(conns))
-	// Make a set of states, 1 per connection
-	actualStates := make([]session.ConnectionStatus, len(conns))
-	for i := range actualStates {
-		actualStates[i] = sessionStatusUnknown
-	}
-
-	// Make expect set for comparison
-	expectStates := make([]session.ConnectionStatus, len(conns))
-	for i := range expectStates {
-		expectStates[i] = expectState
-	}
-
-	for i, conn := range conns {
-		go func(i int, conn *session.Connection) {
-			for {
-				if ctx.Err() != nil {
-					break
-				}
-				_, states, err := sessionRepo.LookupConnection(ctx, conn.PublicId, nil)
-				require.NoError(err)
-				// Look at the first state in the returned list, which will
-				// be the most recent state.
-				actualStates[i] = states[0].Status
-				if states[0].Status == session.StatusClosed {
-					break
-				}
-
-				// Sleep 1s before checking again.
-				time.Sleep(time.Second)
-			}
-
-			wg.Done()
-		}(i, conn)
-	}
-
-	// Wait for all connections to be found.
-	wg.Wait()
-
-	// Assert
-	require.Equal(expectStates, actualStates)
-	s.logger.Debug("successfully asserted all connection states on controller", "expected_states", expectStates, "actual_states", actualStates)
-}
-
-// testSessionConnection abstracts a connected session.
-type testSessionConnection struct {
-	conn   net.Conn
-	logger hclog.Logger
-}
-
-// Connect returns a testSessionConnection for a testSession. Check
-// the unexported connect method for the lower-level details.
-func (s *testSession) Connect(
-	ctx context.Context,
-	t *testing.T, // Just to add cleanup
-) *testSessionConnection {
-	require := require.New(t)
-	conn := s.connect(ctx, t)
-	require.NotNil(conn)
-	t.Cleanup(func() {
-		conn.Close()
-	})
-	require.NotNil(conn)
-
-	return &testSessionConnection{
-		conn:   conn,
-		logger: s.logger,
-	}
-}
-
-// testSendRecv runs a basic send/receive test over the returned
-// connection, and returns whether or not all "pings" made it
-// through.
-//
-// The test is a simple sequence number, ticking up every second to
-// max. The passed in conn is expected to copy whatever it is
-// received.
-func (c *testSessionConnection) testSendRecv(t *testing.T) bool {
-	require := require.New(t)
-	for i := uint32(0); i < testSendRecvSendMax; i++ {
-		// Shuttle over the sequence number as base64.
-		err := binary.Write(c.conn, binary.LittleEndian, i)
-		if err != nil {
-			c.logger.Debug("received error during write", "err", err)
-			if errors.Is(err, net.ErrClosed) ||
-				errors.Is(err, io.EOF) ||
-				errors.Is(err, websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "timed out"}) {
-				return false
-			}
-
-			require.FailNow(err.Error())
-		}
-
-		// Read it back
-		var j uint32
-		err = binary.Read(c.conn, binary.LittleEndian, &j)
-		if err != nil {
-			c.logger.Debug("received error during read", "err", err, "num_successfully_sent", i)
-			if errors.Is(err, net.ErrClosed) ||
-				errors.Is(err, io.EOF) ||
-				errors.Is(err, websocket.CloseError{Code: websocket.StatusPolicyViolation, Reason: "timed out"}) {
-				return false
-			}
-
-			require.FailNow(err.Error())
-		}
-
-		require.Equal(j, i)
-
-		// Sleep 1s
-		time.Sleep(time.Second)
-	}
-
-	c.logger.Debug("finished send/recv successfully", "num_successfully_sent", testSendRecvSendMax)
-	return true
-}
-
-// TestSendRecvAll asserts that we were able to send/recv all pings
-// over the test connection.
-func (c *testSessionConnection) TestSendRecvAll(t *testing.T) {
-	require.True(t, c.testSendRecv(t))
-	c.logger.Debug("successfully asserted send/recv as passing")
-}
-
-// TestSendRecvFail asserts that we were able to send/recv all pings
-// over the test connection.
-func (c *testSessionConnection) TestSendRecvFail(t *testing.T) {
-	require.False(t, c.testSendRecv(t))
-	c.logger.Debug("successfully asserted send/recv as failing")
-}
-
-type testTcpServer struct {
-	logger hclog.Logger
-	ln     net.Listener
-	conns  map[string]net.Conn
-}
-
-func (ts *testTcpServer) Port() uint32 {
-	_, portS, err := net.SplitHostPort(ts.ln.Addr().String())
-	if err != nil {
-		panic(err)
-	}
-
-	if portS == "" {
-		panic("empty port in what should be TCP listener")
-	}
-
-	port, err := strconv.Atoi(portS)
-	if err != nil {
-		panic(err)
-	}
-
-	if port < 1 {
-		panic("zero or negative port in what should be a TCP listener")
-	}
-
-	return uint32(port)
-}
-
-func (ts *testTcpServer) Close() {
-	ts.ln.Close()
-	for _, conn := range ts.conns {
-		conn.Close()
-	}
-}
-
-func (ts *testTcpServer) run() {
-	for {
-		conn, err := ts.ln.Accept()
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				ts.logger.Error("Accept() error in testTcpServer", "err", err)
-			}
-
-			return
-		}
-
-		ts.conns[conn.RemoteAddr().String()] = conn
-
-		go func(c net.Conn) {
-			io.Copy(c, c)
-			c.Close()
-		}(conn)
-	}
-}
-
-func newTestTcpServer(t *testing.T, logger hclog.Logger) *testTcpServer {
-	require := require.New(t)
-	ts := &testTcpServer{
-		logger: logger,
-		conns:  make(map[string]net.Conn),
-	}
-	var err error
-	ts.ln, err = net.Listen("tcp", ":0")
-	require.NoError(err)
-
-	go ts.run()
-	return ts
+	sess.ExpectConnectionStateOnController(ctx, t, sessionRepo, expectState)
 }
