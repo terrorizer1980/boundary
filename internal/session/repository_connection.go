@@ -4,10 +4,17 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/boundary/internal/db"
 	"github.com/hashicorp/boundary/internal/errors"
+	"github.com/hashicorp/boundary/internal/servers"
 )
+
+// deadWorkerConnCloseMinGrace is the minimum allowable setting for
+// the CloseConnectionsForDeadWorkers method. This is synced with
+// the default server liveness setting.
+var deadWorkerConnCloseMinGrace = int(servers.DefaultLiveness.Seconds())
 
 // LookupConnection will look up a connection in the repository and return the connection
 // with its states. If the connection is not found, it will return nil, nil, nil.
@@ -144,6 +151,65 @@ func (r *Repository) CloseDeadConnectionsForWorker(ctx context.Context, serverId
 		return db.NoRowsAffected, errors.Wrap(err, op)
 	}
 	return rowsAffected, nil
+}
+
+type CloseConnectionsForDeadWorkersResult struct {
+	ServerId                string
+	LastUpdateTime          time.Time
+	NumberConnectionsClosed int
+}
+
+// CloseConnectionsForDeadWorkers will run
+// closeConnectionsForDeadServersCte to look for connections that
+// should be marked because they are on a server that is no longer
+// sending status updates to the controller(s).
+//
+// The only input to the method is the grace period, in seconds.
+func (r *Repository) CloseConnectionsForDeadWorkers(ctx context.Context, gracePeriod int) ([]CloseConnectionsForDeadWorkersResult, error) {
+	const op = "session.(Repository).CloseConnectionsForDeadWorkers"
+	if gracePeriod < deadWorkerConnCloseMinGrace {
+		return nil, errors.New(
+			errors.InvalidParameter, op, fmt.Sprintf("gracePeriod must be at least %d seconds", deadWorkerConnCloseMinGrace))
+	}
+
+	results := make([]CloseConnectionsForDeadWorkersResult, 0)
+	_, err := r.writer.DoTx(
+		ctx,
+		db.StdRetryCnt,
+		db.ExpBackoff{},
+		func(reader db.Reader, w db.Writer) error {
+			rows, err := w.Query(ctx, closeConnectionsForDeadServersCte, []interface{}{gracePeriod})
+			if err != nil {
+				return errors.Wrap(err, op)
+			}
+
+			for rows.Next() {
+				var (
+					serverId                string
+					lastUpdateTime          time.Time
+					numberConnectionsClosed int
+				)
+
+				if err := rows.Scan(&serverId, &lastUpdateTime, &numberConnectionsClosed); err != nil {
+					return errors.Wrap(err, op)
+				}
+
+				results = append(results, CloseConnectionsForDeadWorkersResult{
+					ServerId:                serverId,
+					LastUpdateTime:          lastUpdateTime,
+					NumberConnectionsClosed: numberConnectionsClosed,
+				})
+			}
+
+			return nil
+		},
+	)
+
+	if err != nil {
+		return nil, errors.Wrap(err, op)
+	}
+
+	return results, nil
 }
 
 // ShouldCloseConnectionsOnWorker will run shouldCloseConnectionsCte to look

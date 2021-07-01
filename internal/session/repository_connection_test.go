@@ -2,9 +2,11 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/server"
 	"github.com/hashicorp/boundary/internal/db"
 	"github.com/hashicorp/boundary/internal/errors"
 	"github.com/hashicorp/boundary/internal/iam"
@@ -328,6 +330,206 @@ func TestRepository_CloseDeadConnectionsOnWorker(t *testing.T) {
 			}
 		}
 		assert.True(foundClosed != strutil.StrListContains(shouldStayOpen, conn.PublicId))
+	}
+}
+
+func TestRepository_CloseConnectionsForDeadWorkers(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	conn, _ := db.TestSetup(t, "postgres")
+	rw := db.New(conn)
+	wrapper := db.TestWrapper(t)
+	iamRepo := iam.TestRepo(t, conn, wrapper)
+	kms := kms.TestKms(t, conn, wrapper)
+	repo, err := NewRepository(rw, rw, kms)
+	require.NoError(err)
+	ctx := context.Background()
+
+	// connection count = 6 * states(authorized, connected, closed = 3) * servers_with_open_connections(3)
+	numConns := 54
+
+	// Create four "workers". This is similar to the setup in
+	// TestRepository_CloseDeadConnectionsOnWorker, but a bit more complex;
+	// firstly, the last worker will have no connections at all, and we will be
+	// closing the others in stages to test multiple servers being closed at
+	// once.
+	worker1 := TestWorker(t, conn, wrapper, WithServerId("worker1"))
+	worker2 := TestWorker(t, conn, wrapper, WithServerId("worker2"))
+	worker3 := TestWorker(t, conn, wrapper, WithServerId("worker3"))
+	worker4 := TestWorker(t, conn, wrapper, WithServerId("worker4"))
+
+	// Create sessions on the first three, activate, and authorize connections
+	var worker1ConnIds, worker2ConnIds, worker3ConnIds []string
+	for i := 0; i < numConns; i++ {
+		var serverId string
+		if i%3 == 0 {
+			serverId = worker1.PrivateId
+		} else if i%3 == 1 {
+			serverId = worker2.PrivateId
+		} else {
+			serverId = worker3.PrivateId
+		}
+		sess := TestDefaultSession(t, conn, wrapper, iamRepo, WithServerId(serverId), WithDbOpts(db.WithSkipVetForWrite(true)))
+		sess, _, err = repo.ActivateSession(ctx, sess.GetPublicId(), sess.Version, serverId, "worker", []byte("foo"))
+		require.NoError(err)
+		c, cs, _, err := repo.AuthorizeConnection(ctx, sess.GetPublicId(), serverId)
+		require.NoError(err)
+		require.Len(cs, 1)
+		require.Equal(StatusAuthorized, cs[0].Status)
+		if i%3 == 0 {
+			worker1ConnIds = append(worker1ConnIds, c.GetPublicId())
+		} else if i%3 == 1 {
+			worker2ConnIds = append(worker2ConnIds, c.GetPublicId())
+		} else {
+			worker3ConnIds = append(worker3ConnIds, c.GetPublicId())
+		}
+	}
+
+	// Mark a third of the connections connected, a third closed, and leave the
+	// others authorized. This is just to ensure we have a spread when we test it
+	// out.
+	for _, connIds := range [][]string{worker1ConnIds, worker2ConnIds, worker3ConnIds} {
+		for i, connId := range connIds {
+			if i%3 == 0 {
+				_, cs, err := repo.ConnectConnection(ctx, ConnectWith{
+					ConnectionId:       connId,
+					ClientTcpAddress:   "127.0.0.1",
+					ClientTcpPort:      22,
+					EndpointTcpAddress: "127.0.0.1",
+					EndpointTcpPort:    22,
+				})
+				require.NoError(err)
+				require.Len(cs, 2)
+				var foundAuthorized, foundConnected bool
+				for _, status := range cs {
+					if status.Status == StatusAuthorized {
+						foundAuthorized = true
+					}
+					if status.Status == StatusConnected {
+						foundConnected = true
+					}
+				}
+				require.True(foundAuthorized)
+				require.True(foundConnected)
+			} else if i%3 == 1 {
+				resp, err := repo.CloseConnections(ctx, []CloseWith{
+					{
+						ConnectionId: connId,
+						ClosedReason: ConnectionCanceled,
+					},
+				})
+				require.NoError(err)
+				require.Len(resp, 1)
+				cs := resp[0].ConnectionStates
+				require.Len(cs, 2)
+				var foundAuthorized, foundClosed bool
+				for _, status := range cs {
+					if status.Status == StatusAuthorized {
+						foundAuthorized = true
+					}
+					if status.Status == StatusClosed {
+						foundClosed = true
+					}
+				}
+				require.True(foundAuthorized)
+				require.True(foundClosed)
+			}
+		}
+	}
+
+	// There is a 15 second delay to account for time for the connections to
+	// transition
+	time.Sleep(15 * time.Second)
+
+	// updateServer is a helper for updating the update time for our servers.
+	updateServer := func(t *testing.T, w *server.Server) {
+		t.Helper()
+		require := require.New(t)
+		_, rowsUpdated, err := serversRepo.UpsertServer(ctx, w)
+		require.NoError(err)
+		require.Equal(1, rowsUpdated)
+	}
+
+	// requireClosed is a helper where we expect all connections on a worker to
+	// be closed.
+	updateServer := func(t *testing.T, w *server.Server) {
+		t.Helper()
+		require := require.New(t)
+
+		var conns []*Connection
+		require.NoError(repo.list(ctx, &conns, "", nil))
+		for _, conn := range conns {
+			_, states, err := repo.LookupConnection(ctx, conn.PublicId)
+			require.NoError(err)
+			for _, state := range states {
+				if state.Status == StatusClosed {
+					foundClosed = true
+					break
+				}
+			}
+			assert.True(foundClosed == strutil.StrListContains(shouldBeClosed, conn.PublicId))
+		}
+
+		_, rowsUpdated, err := serversRepo.UpsertServer(ctx, w)
+		require.NoError(err)
+		require.Equal(1, rowsUpdated)
+	}
+
+	// Now try some scenarios.
+	{
+		// First, test the error/validation case.
+		result, err := repo.CloseConnectionsForDeadWorkers(ctx, 0)
+		require.ErrorIs(err, errors.E(
+			errors.WithCode(errors.InvalidParameter),
+			errors.WithOp("session.(Repository).CloseDeadConnectionsForWorker"),
+			errors.WithMsg(fmt.Sprintf("gracePeriod must be at least %d seconds", deadWorkerConnCloseMinGrace)),
+		))
+		require.Nil(result)
+	}
+
+	{
+		// Now, try the basis, or where all workers are reporting in.
+		updateServer(t, worker1)
+		updateServer(t, worker2)
+		updateServer(t, worker3)
+		updateServer(t, worker4)
+
+		result, err := repo.CloseConnectionsForDeadWorkers(ctx, deadWorkerConnCloseMinGrace)
+		require.NoError(err)
+		require.Empty(result)
+	}
+
+	{
+		// Now try a zero case - similar to the basis, but only in that no results
+		// are expected to be returned for workers with no connections, even if
+		// they are dead. Here, the server with no connections is worker #4.
+		time.Sleep(time.Second * deadWorkerConnCloseMinGrace)
+		updateServer(t, worker1)
+		updateServer(t, worker2)
+		updateServer(t, worker3)
+
+		result, err := repo.CloseConnectionsForDeadWorkers(ctx, deadWorkerConnCloseMinGrace)
+		require.NoError(err)
+		require.Empty(result)
+	}
+
+	{
+		// The first induction is letting the first worker "die" by not updating it
+		// too. All of its authorized and connected connections should be dead.
+		time.Sleep(time.Second * deadWorkerConnCloseMinGrace)
+		updateServer(t, worker2)
+		updateServer(t, worker3)
+
+		result, err := repo.CloseConnectionsForDeadWorkers(ctx, deadWorkerConnCloseMinGrace)
+		require.NoError(err)
+		// Assert that we have one result with the appropriate ID and number of connections closed.
+		require.Equal([]CloseConnectionsForDeadWorkersResult{
+			{
+				ServerId:                worker1.Name(),
+				LastUpdateTime:          worker1.UpdateTime,
+				NumberConnectionsClosed: 12, // 18 per server, with 6 remaining open
+			},
+		}, result)
 	}
 }
 

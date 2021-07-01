@@ -280,6 +280,68 @@ with
     returning public_id
   `
 
+	// closeConnectionsForDeadServersCte finds connections that are:
+	//
+	// * not closed
+	// * belong to servers that have not reported in within an acceptable
+	// threshold of time
+	//
+	// and marks them as closed.
+	//
+	// The query returns the set of servers that have had connections closed
+	// along with their last update time and the number of connections closed on
+	// each.
+	closeConnectionsForDeadServersCte = `
+with
+  -- Get dead servers, parameterized off of grace period in seconds
+  dead_servers as (
+    select private_id, update_time
+    from server
+    where update_time < now() - interval '1 second' * $1
+  ),
+  -- Find connections that are not closed so we can reference those IDs
+  unclosed_connections as (
+    select connection_id
+      from session_connection_state
+    where
+      -- It's the current state
+      end_time is null
+        and
+      -- Current state isn't closed state
+      state in ('authorized', 'connected')
+        and
+      -- It's not in limbo between when it moved into this state and when
+      -- it started being reported by the worker, which is roughly every
+      -- 2-3 seconds
+      start_time < now() - interval '10 seconds'
+  ),
+  connections_to_close as (
+    select public_id
+      from session_connection
+    where
+      -- Related to the worker that just reported to us
+      server_id in (select private_id from dead_servers)
+        and
+      -- Only unclosed ones
+      public_id in (select connection_id from unclosed_connections)
+  ),
+  closed_connections as (
+    update session_connection
+      set
+        closed_reason = 'system error'
+      where
+        public_id in (select public_id from connections_to_close)
+      returning public_id, server_id
+  ),
+  select
+    dead_servers.private_id as private_id,
+    dead_servers.update_time as last_update_time,
+    count(closed_connections.public_id) as number_connections_closed
+  from dead_servers
+    left join closed_connections
+      on dead_servers.private_id = closed_connections.server_id
+  `
+
 	// shouldCloseConnectionsCte finds connections that are marked as closed in
 	// the database given a set of connection IDs. They are returned along with
 	// their associated session ID.

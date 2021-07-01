@@ -22,6 +22,7 @@ import (
 	"github.com/hashicorp/boundary/internal/cmd/config"
 	"github.com/hashicorp/boundary/internal/db"
 	"github.com/hashicorp/boundary/internal/kms"
+	"github.com/hashicorp/boundary/internal/servers"
 	"github.com/hashicorp/boundary/internal/types/scope"
 	"github.com/hashicorp/boundary/sdk/strutil"
 	"github.com/hashicorp/boundary/version"
@@ -41,8 +42,20 @@ import (
 )
 
 const (
-	defaultStatusGracePeriod = 15 * time.Second
-	statusGracePeriodEnvVar  = "BOUNDARY_STATUS_GRACE_PERIOD"
+	// defaultStatusGracePeriod is the default status grace period, or the period
+	// of time that we will go without a status report before we start
+	// disconnecting and marking connections as closed. This is tied to the
+	// server default liveness setting, a related value. See the servers package
+	// for more details.
+	defaultStatusGracePeriod = servers.DefaultLiveness
+
+	// statusGracePeriodEnvVar is the environment variable that can be used to
+	// configure the status grace period. This setting is provided in seconds,
+	// and can never be lower than the default status grace period defined above.
+	//
+	// TODO: This value is temporary, it will be removed once we have a better
+	// story/direction on attributes and system defaults.
+	statusGracePeriodEnvVar = "BOUNDARY_STATUS_GRACE_PERIOD"
 )
 
 type Server struct {
@@ -631,8 +644,8 @@ func MakeSighupCh() chan struct{} {
 //   * Via the supplied value if non-zero.
 //   * BOUNDARY_STATUS_GRACE_PERIOD, if defined, can be set to an
 //   integer value to define the setting.
-//   * If either of these is missing, the default (15 seconds) is
-//   used.
+//   * If either of these is missing, the default is used. See the
+//   defaultStatusGracePeriod value for the default value.
 //
 // The minimum setting for this value is the default setting. Values
 // below this will be reset to the default.
